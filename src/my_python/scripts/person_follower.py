@@ -19,6 +19,14 @@ from std_msgs.msg import Bool
 import warnings
 import os
 
+#Pointcloud imports
+
+from sensor_msgs.msg import PointCloud2
+import sensor_msgs.point_cloud2 as pc2
+from geometry_msgs.msg import PointStamped
+import tf2_ros
+import tf2_geometry_msgs
+
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 if os.path.isfile("cmd_vel_log.txt"):
     os.remove("cmd_vel_log.txt")
@@ -36,6 +44,14 @@ frontStopflag = False
 suddenStopflag = False
 leftStopflag = False
 rightStopflag = False
+
+## pointcloud variables
+tf_buffer = None
+tf_listener = None
+camera_obstacle = False
+ROBOT_RADIUS = 0.25 
+SAFETY_DISTANCE = 0.5 
+TOTAL_SAFE_DISTANCE = ROBOT_RADIUS + SAFETY_DISTANCE  
 
 
 RUN = True
@@ -125,6 +141,8 @@ def person_detect(data_):
     global RFLAG
     global LFLAG
 
+    global camera_obstacle
+
     if is_running_A:
         return 0
     is_running_A = True
@@ -175,6 +193,9 @@ def person_detect(data_):
 
         if frontStopflagObs and (depth_ > 0.4):
             rospy.set_param('/person_follower/movement', "Front Obstacle detected")
+
+        # if camera_obstacle:
+        #     rospy.set_param('/person_follower/movement', "Lower Obstacle detected")
 
         # if hardstopflag :
         # rospy.set_param('/person_follower/movement',"*******************************")
@@ -437,6 +458,102 @@ def lidar_callback(msg):
     is_running_C = False
     return 0
 
+def pointcloud_callback(msg):
+    global camera_obstacle
+    
+    try:
+        points = []
+        for point in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            points.append([point[0], point[1], point[2]])
+        
+        if not points:
+            camera_obstacle = False
+            return
+        
+        points = np.array(points)
+        min_distance = float('inf')
+        obstacle_count = 0
+        low_obstacle_count = 0  # Count obstacles below LiDAR level
+        
+        # Transform points to base_link frame if needed
+        if msg.header.frame_id != "base_link":
+            try:
+                # Get transform from point cloud frame to base_link
+                transform = tf_buffer.lookup_transform("base_link", msg.header.frame_id, 
+                                                     msg.header.stamp, rospy.Duration(0.1))
+                
+                # Apply transformation to each point
+                transformed_points = []
+                for point in points:
+                    point_stamped = PointStamped()
+                    point_stamped.header.frame_id = msg.header.frame_id
+                    point_stamped.point.x = point[0]
+                    point_stamped.point.y = point[1]
+                    point_stamped.point.z = point[2]
+                    
+                    transformed_point = tf2_geometry_msgs.do_transform_point(point_stamped, transform)
+                    transformed_points.append([transformed_point.point.x, 
+                                             transformed_point.point.y, 
+                                             transformed_point.point.z])
+                
+                points = np.array(transformed_points)
+                
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, 
+                   tf2_ros.ExtrapolationException) as e:
+                rospy.logwarn(f"TF lookup failed: {e}")
+                # Use points as-is if transform fails
+        
+        # Check each point for obstacles
+        for point in points:
+            x, y, z = point
+            
+            # Filter points by height - focus on obstacles that LiDAR cannot see well
+            # LiDAR is at 0.245m height, so focus on obstacles below AND above this level
+            # Remove only obvious ground/noise points but keep very low obstacles
+            if z < -0.1 or z > 2.5:  # Allow very low points (8cm = 0.08m should pass)
+                continue
+            
+            # Filter out points that are too far away to be relevant
+            if abs(x) > 3.0 or abs(y) > 3.0:
+                continue
+            
+            # Calculate horizontal distance from robot center
+            horizontal_distance = math.sqrt(x**2 + y**2)
+            
+            # Check if point is within safety zone
+            if horizontal_distance < TOTAL_SAFE_DISTANCE:
+                min_distance = min(min_distance, horizontal_distance)
+                obstacle_count += 1
+                
+                # Count low obstacles (below LiDAR level)
+                if z < 0.25:  # Below LiDAR level (0.245m + small margin)
+                    low_obstacle_count += 1
+                
+                # Debug: Print obstacle points with height info
+                if obstacle_count <= 10:  # Print more detections for debugging
+                    height_status = "LOW (LiDAR blind)" if z < 0.25 else "HIGH (LiDAR visible)"
+                    rospy.loginfo(f"Obstacle point {obstacle_count}: x={x:.2f}, y={y:.2f}, z={z:.2f}m, dist={horizontal_distance:.2f}m [{height_status}]")
+                    # Add this in the pointcloud_callback function, right after the height filtering
+                    if 0.05 < z < 0.15 and horizontal_distance < 1.0:  # Focus on low obstacles nearby
+                        rospy.loginfo(f"DEBUG: Low obstacle candidate: x={x:.3f}, y={y:.3f}, z={z:.3f}m (8cm = 0.080m), dist={horizontal_distance:.3f}m")
+        
+        # Update obstacle status - be more sensitive for safety
+        # Reduced threshold: even 1 point within safety zone should trigger stopping
+        if obstacle_count >= 2 and min_distance < TOTAL_SAFE_DISTANCE:
+            camera_obstacle = True
+            if low_obstacle_count > 0:
+                rospy.logwarn(f"Camera: LOW obstacle detected at {min_distance:.2f}m (LiDAR blind spot) - {low_obstacle_count} low points, {obstacle_count} total points")
+            else:
+                rospy.logwarn(f"Camera: Obstacle detected at {min_distance:.2f}m from robot center ({obstacle_count} points)")
+        else:
+            camera_obstacle = False
+            if obstacle_count > 0:
+                rospy.loginfo(f"Camera: Found {obstacle_count} points but distance > {TOTAL_SAFE_DISTANCE:.2f}m (safe)")
+            
+    except Exception as e:
+        rospy.logerr(f"Error processing point cloud data: {e}")
+        camera_obstacle = True  # Fail-safe: assume obstacle if error
+
 
 def is_point_in_triangle(point, v1, v2, v3):
     def RobotPathwayZone(p1, p2, p3):
@@ -470,28 +587,37 @@ def readLaser(move_dir=True):
     global retGoalValuesAng
     global RFLAG
     global LFLAG
-
-    critical_zone_count = 0
+    global camera_obstacle
 
     ctCopyLidar = copy.deepcopy(LocalObj)
 
-    for i in range(len(ctCopyLidar)):
-        theta = i * degree_increment
-        x = ctCopyLidar[i] * math.cos(math.radians(theta))
-        y = ctCopyLidar[i] * math.sin(math.radians(theta))
-        point = np.array([x, y])
-        in_triangle, zone = is_point_in_triangle(point, vertex1, vertex2, vertex3)
-        if in_triangle:
-            #print(f"Point {point} is in {zone}")
+    if camera_obstacle:
+        rospy.loginfo("ROBOT STOPPED: obstacle detected")
+        suddenStopflag = True
+        return
+    
+    critical_zone_count = 0
 
-            if zone in ['Critical Zone', 'Less Critical Zone', 'Least Critical Zone', 'Safe Zone']:
-                critical_zone_count += 1
-                if critical_zone_count > 3:
-                    suddenStopflag = True
-                    break
+    if not camera_obstacle:
+        for i in range(len(ctCopyLidar)):
+            theta = i * degree_increment
+            x = ctCopyLidar[i] * math.cos(math.radians(theta))
+            y = ctCopyLidar[i] * math.sin(math.radians(theta))
+            point = np.array([x, y])
+            in_triangle, zone = is_point_in_triangle(point, vertex1, vertex2, vertex3)
+            if in_triangle:
+                #print(f"Point {point} is in {zone}")
 
-    if critical_zone_count <=3:
+                if zone in ['Critical Zone', 'Less Critical Zone', 'Least Critical Zone', 'Safe Zone']:
+                    critical_zone_count += 1
+                    if critical_zone_count > 3:
+                        rospy.loginfo("ROBOT STOP")
+                        suddenStopflag = True
+                        break
+
+    if critical_zone_count <=3 and not camera_obstacle:
         suddenStopflag = False
+
 
     rightValues = ctCopyLidar[:150]
     leftValues = ctCopyLidar[-150:]
@@ -521,6 +647,12 @@ def readLaser(move_dir=True):
 if __name__ == '__main__':
     try:
         rospy.init_node('person_follower_node', anonymous=True)
+
+        # Initialize TF buffer and listener and Pointcloud subscriber
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer)
+        rospy.Subscriber('/cloud_concatenated', PointCloud2, pointcloud_callback, queue_size=1)
+
         rospy.Subscriber("/person_position", String, person_detect)
         rospy.Subscriber('/scan', LaserScan, lidar_callback)
         rospy.Subscriber('/odom', Odometry, getbotSpeed)
