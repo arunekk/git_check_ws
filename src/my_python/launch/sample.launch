@@ -1,0 +1,9 @@
+<launch>
+
+<!-- <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+</node> -->
+
+<node pkg="my_python" type="glass_scan.py" respawn="false" name="basic_stuff" output="screen">
+</node>
+
+</launch>
