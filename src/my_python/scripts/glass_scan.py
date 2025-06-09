@@ -20,6 +20,7 @@ def scan_callback(msg):
 
     if not glass_detected:
         rospy.loginfo("Solid obstacle")
+        print("Solid obstacle detected")
 
 def main():
     rospy.init_node('glass_detector', anonymous=True)
